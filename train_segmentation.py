@@ -4,133 +4,117 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
-from dataloader import SegmentationDataset
+from dataloader import SegmentationDataset 
 from model import UNet
-import matplotlib.pyplot as plt
 import numpy as np
 import os
-import csv
 import time
-from datetime import datetime
 
-SEGMENTATION_COLOURS = {0:[0,0,0],1:[255,0,0],2:[0,253,0],3:[0,0,250], 4:[253,255,0]}
+def calculate_iou(pred, target, num_classes=4):
+    pred = pred.numpy().flatten()
+    target = target.numpy().flatten()
+    valid = target != 255
+    return np.mean([
+        (np.sum((pred[valid] == c) & (target[valid] == c)) + 1e-6) / 
+        (np.sum((pred[valid] == c) | (target[valid] == c)) + 1e-6)
+        for c in range(num_classes)
+    ])
 
-
-def calculate_iou(pred_mask, target_mask, num_classes=5):
-    ious = []
-    
-    if torch.is_tensor(pred_mask):
-        pred_mask = pred_mask.cpu().numpy()
-    if torch.is_tensor(target_mask):
-        target_mask = target_mask.cpu().numpy()
-    
-    for cls in range(num_classes):
-        pred_inds = pred_mask == cls
-        target_inds = target_mask == cls
-        
-        intersection = np.logical_and(pred_inds, target_inds).sum()
-        union = np.logical_or(pred_inds, target_inds).sum()
-        
-        iou = intersection / (union + 1e-6)  
-        ious.append(iou)
-    
-    return np.mean(ious)
-
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device):
-    best_val_loss = float('inf')
-    
-    metrics_dir = 'metrics'
-    os.makedirs(metrics_dir, exist_ok=True)
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    metrics_file = os.path.join(metrics_dir, f'training_metrics_{timestamp}.csv')
-    
-    with open(metrics_file, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Epoch', 'Train Loss', 'Val Loss', 'Mean IoU', 'Time (s)'])
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs):
+    best_iou = 0
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=3, factor=0.5)
     
     for epoch in range(num_epochs):
-        epoch_start_time = time.time()
+        # Training
         model.train()
         train_loss = 0
-        train_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
+        start_time = time.time()
         
-        for images, masks in train_bar:
-            images = images.to(device)
-            masks = masks.to(device)
-            
+        for images, masks in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}'):
             optimizer.zero_grad()
             outputs = model(images)
             loss = criterion(outputs, masks)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            
             train_loss += loss.item()
-            train_bar.set_postfix({'loss': train_loss / len(train_loader)})
         
-        avg_train_loss = train_loss / len(train_loader)
-        
+        # Validation
         model.eval()
-        val_loss = 0
-        all_preds = []
-        all_targets = []
-        
+        val_loss, val_iou = 0, 0
         with torch.no_grad():
             for images, masks in val_loader:
-                images = images.to(device)
-                masks = masks.to(device)
                 outputs = model(images)
-                loss = criterion(outputs, masks)
-                val_loss += loss.item()
-                
-                predictions = torch.argmax(outputs, dim=1)
-                all_preds.append(predictions.cpu().numpy())
-                all_targets.append(masks.cpu().numpy())
+                val_loss += criterion(outputs, masks).item()
+                val_iou += calculate_iou(torch.argmax(outputs, 1), masks)
         
-        avg_val_loss = val_loss / len(val_loader)
+        # Metrics
+        avg_train = train_loss / len(train_loader)
+        avg_val = val_loss / len(val_loader)
+        avg_iou = val_iou / len(val_loader)
+        epoch_time = time.time() - start_time
         
-        all_preds = np.concatenate(all_preds, axis=0)
-        all_targets = np.concatenate(all_targets, axis=0)
-        mean_iou = calculate_iou(all_preds, all_targets)
+        scheduler.step(avg_iou)
         
-        epoch_time = time.time() - epoch_start_time        
-        with open(metrics_file, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([epoch+1, avg_train_loss, avg_val_loss, mean_iou, epoch_time])
+        print(f'Epoch {epoch+1:2d} | Time: {epoch_time:5.1f}s | '
+              f'Train: {avg_train:.4f} | Val: {avg_val:.4f} | '
+              f'IoU: {avg_iou:.4f} | LR: {optimizer.param_groups[0]["lr"]:.2e}')
         
-        print(f'Epoch {epoch+1}/{num_epochs}:')
-        print(f'  Train Loss: {avg_train_loss:.4f}')
-        print(f'  Val Loss: {avg_val_loss:.4f}')
-        print(f'  Mean IoU: {mean_iou:.4f}')
-        print(f'  Time: {epoch_time:.2f}s')
-        
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        if avg_iou > best_iou:
+            best_iou = avg_iou
             torch.save(model.state_dict(), 'best_model.pth')
-            print('Model saved!')
+            print(f'Saved best model (IoU {avg_iou:.4f})')
 
 def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
-
-    transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    train_dataset = SegmentationDataset('dataset/train', transform=transform)
-    val_dataset = SegmentationDataset('dataset/val', transform=transform)
-
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=4)
-
-    model = UNet(n_classes=5).to(device)
+    # CPU optimizations
+    torch.set_num_threads(os.cpu_count() or 1)
     
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-    train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=50, device=device)
+    # Data transforms
+    train_transform = transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    # Verify dataset paths
+    train_path = os.path.join('dataset', 'train')
+    val_path = os.path.join('dataset', 'val')
+    if not os.path.exists(train_path) or not os.path.exists(val_path):
+        raise FileNotFoundError("Dataset folders not found. Expected structure: dataset/{train,val}/{images,labels}")
+    
+    # Initialize datasets
+    train_set = SegmentationDataset(train_path, train_transform)
+    val_set = SegmentationDataset(val_path, val_transform)
+    
+    # Data loaders
+    batch_size = 4
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=min(0, os.cpu_count())
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=min(0, os.cpu_count())
+    )
+    
+    # Model setup
+    model = UNet(n_classes=4)
+    criterion = nn.CrossEntropyLoss(ignore_index=255)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    
+    # Train
+    train_model(model, train_loader, val_loader, criterion, optimizer, 50)
 
 if __name__ == '__main__':
-    main() 
+    main()
